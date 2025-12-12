@@ -1,0 +1,370 @@
+"""
+Kolmogorov Flow Fourier Analysis 
+"""
+
+import numpy as np
+import os
+import argparse
+
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except Exception:
+    HAS_MATPLOTLIB = False
+    print("Warning: matplotlib not available — plotting will be skipped.")
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
+    print("Warning: tqdm not available — progress bars will be disabled.")
+
+# CLI for overriding file locations and some parameters
+parser = argparse.ArgumentParser(description='Kolmogorov Flow Fourier Analysis (text-consistent)')
+parser.add_argument('--file', '-f', default=None, help='Path to velocity_combined .npy file (shape nt,2,nx,ny)')
+parser.add_argument('--skip-plots', action='store_true', help='Do not attempt to create plots (useful if matplotlib missing)')
+parser.add_argument('--nu', type=float, default=1.0, help='Kinematic viscosity (ν) for dissipation calculation (default: 1.0)')
+parser.add_argument('--Lx', type=float, default=2.0*np.pi, help='Domain length Lx (default 2π)')
+parser.add_argument('--Ly', type=float, default=2.0*np.pi, help='Domain length Ly (default 2π)')
+args = parser.parse_args()
+
+# ============================================================
+# 1. LOAD DATA
+# ============================================================
+
+possible_files = [
+    args.file,
+    r"C:\Users\helen\Downloads\velocity_combined.npy",
+    r"C:\Users\helen\OneDrive\Desktop\Velocity\velocity_combined.npy",
+    r"C:\Users\helen\Desktop\velocity_combined.npy",
+    "velocity_combined.npy",
+    "1.npy",
+]
+
+data_file = None
+for p in possible_files:
+    if not p:
+        continue
+    if os.path.exists(p):
+        data_file = p
+        break
+
+if data_file is None:
+    cwd_npy = [f for f in os.listdir('.') if f.endswith('.npy')]
+    if cwd_npy:
+        data_file = cwd_npy[0]
+        print(f"Using .npy from current dir: {data_file}")
+    else:
+        raise FileNotFoundError("Could not find velocity_combined .npy file. Provide --file / -f to specify path.")
+
+print(f"Loading data from: {data_file}")
+data = np.load(data_file, mmap_mode=None)
+
+nt, ncomp, nx, ny = data.shape
+assert ncomp == 2, "Expected two velocity components (u,v)"
+
+Lx = float(args.Lx)
+Ly = float(args.Ly)
+nu = float(args.nu)
+
+# Integer mode indices m and n (from FFT ordering)
+m_vec = np.fft.fftfreq(nx) * nx   # integers in -Nx/2..Nx/2-1
+n_vec = np.fft.fftfreq(ny) * ny
+
+# Physical wavenumbers: kx = 2π m / Lx, ky = 2π n / Ly
+kx_phys = (2.0 * np.pi / Lx) * m_vec
+ky_phys = (2.0 * np.pi / Ly) * n_vec
+KX_phys, KY_phys = np.meshgrid(kx_phys, ky_phys, indexing='ij')
+Kmag_phys = np.sqrt(KX_phys**2 + KY_phys**2)
+
+# Also keep integer-mode Kmag for binning if desired, but we will use physical Kmag to match text
+print(f"Domain Lx={Lx}, Ly={Ly}; using physical wavenumbers kx=2π m/Lx, ky=2π n/Ly")
+
+# ============================================================
+# 2. PREPARE STORAGE FOR SPECTRAL QUANTITIES & DISSIPATION
+# ============================================================
+E_sum = np.zeros((nx, ny), dtype=float)
+E_real_sum = 0.0
+
+eps_ts = np.zeros(nt, dtype=float)        # instantaneous dissipation ε(t)
+amp_list = []
+phi_list = []
+Iu_list = []
+Ekf_list = []
+
+print("Computing Fourier transforms, instantaneous dissipation, and energy spectra...")
+
+# We'll compute everything per time step so we can produce ε(t) and forcing-mode time series
+for t in tqdm(range(nt)):
+    u = data[t, 0]
+    v = data[t, 1]
+
+    # Real-space kinetic energy (spatial mean)
+    E_real_sum += 0.5 * np.mean(u**2 + v**2)
+
+    # Fourier transform (normalize so that ifft2 of the normalized array returns original)
+    u_hat = np.fft.fft2(u) / (nx * ny)
+    v_hat = np.fft.fft2(v) / (nx * ny)
+
+    # Spectral kinetic energy per mode (time instant)
+    E_k = 0.5 * (np.abs(u_hat)**2 + np.abs(v_hat)**2)
+    E_sum += E_k
+
+    # --- Instantaneous dissipation via spectral derivatives (spectrally accurate)
+    # Compute spectral derivatives: multiply by i*k
+    # Note: u_hat is normalized by (nx*ny) already, ifft2 of derivative hats returns derivatives in physical space.
+    ux_hat = 1j * KX_phys * u_hat
+    uy_hat = 1j * KY_phys * u_hat
+    vx_hat = 1j * KX_phys * v_hat
+    vy_hat = 1j * KY_phys * v_hat
+
+    # Back to physical space derivatives
+    ux = np.fft.ifft2(ux_hat)
+    uy = np.fft.ifft2(uy_hat)
+    vx = np.fft.ifft2(vx_hat)
+    vy = np.fft.ifft2(vy_hat)
+
+    # squared gradient magnitude and spatial average
+    grad2 = (np.abs(ux)**2 + np.abs(uy)**2 + np.abs(vx)**2 + np.abs(vy)**2).real
+    eps_t = nu * np.mean(grad2)    # instantaneous domain-averaged dissipation
+    eps_ts[t] = eps_t
+
+    # --- Forcing-mode diagnostics (use the time-averaged E_mean later to find kf index, but we can find per-time too)
+    # We'll postpone choosing kf until we have E_mean; for now we'll store u_hat and v_hat for later read.
+    amp_list.append(u_hat)   # temporarily store full hats for later indexing
+    phi_list.append(v_hat)   # same trick; will recompute amplitude/phase after kf is known
+
+# After loop: compute mean quantities and identify forcing mode from E_mean
+E_mean = E_sum / nt
+E_real_mean = E_real_sum / nt
+
+# find forcing (dominant) mode in E_mean
+kf_idx = np.unravel_index(np.nanargmax(E_mean), E_mean.shape)
+kx_idx, ky_idx = kf_idx
+m_kf = int(np.round(m_vec[kx_idx]))
+n_kf = int(np.round(n_vec[ky_idx]))
+kx_val = kx_phys[kx_idx]
+ky_val = ky_phys[ky_idx]
+print(f"Dominant (forcing) mode indices (m,n) = ({m_kf},{n_kf}) -> physical k = ({kx_val:.6g}, {ky_val:.6g})")
+
+# Compute time series for forcing-mode amplitude, phase, I(t) and modal energy E_kf(t)
+amp_ts = np.zeros(nt, dtype=float)
+phi_ts = np.zeros(nt, dtype=float)
+Iu_ts = np.zeros(nt, dtype=float)
+Ekf_ts = np.zeros(nt, dtype=float)
+
+for t in range(nt):
+    u_hat_t = amp_list[t]
+    v_hat_t = phi_list[t]
+
+    # Extract the complex Fourier coefficients for the forcing mode (unshifted indexing)
+    uhat_kf = u_hat_t[kx_idx, ky_idx]
+    vhat_kf = v_hat_t[kx_idx, ky_idx]
+
+    # As described in your text: combined complex amplitude a = û + i v̂
+    a_kf = uhat_kf + 1j * vhat_kf
+    amp = np.abs(a_kf)
+    phi = np.angle(a_kf)
+    Iu = -amp * np.sin(phi)   # the textual diagnostic you specified
+
+    # Modal kinetic energy for that mode (rigorous definition)
+    Ekf = 0.5 * (np.abs(uhat_kf)**2 + np.abs(vhat_kf)**2)
+
+    amp_ts[t] = amp
+    phi_ts[t] = phi
+    Iu_ts[t] = Iu
+    Ekf_ts[t] = Ekf
+
+# ============================================================
+# 5. RADIAL ENERGY SPECTRUM E(|k|) and spectral dissipation ε(|k|)
+# ============================================================
+k_flat = Kmag_phys.flatten()
+E_flat = E_mean.flatten()
+mask = k_flat > 0
+k_vals = k_flat[mask]
+E_vals = E_flat[mask]
+
+nbins = 40
+k_bins = np.logspace(np.log10(k_vals.min()), np.log10(k_vals.max()), nbins + 1)
+E_radial, k_centers = np.zeros(nbins), np.zeros(nbins)
+
+for i in range(nbins):
+    idx = (k_vals >= k_bins[i]) & (k_vals < k_bins[i+1])
+    if np.any(idx):
+        E_radial[i] = np.mean(E_vals[idx])
+        k_centers[i] = np.mean(k_vals[idx])
+    else:
+        E_radial[i] = np.nan
+        k_centers[i] = np.nan
+
+valid = ~np.isnan(E_radial) & ~np.isnan(k_centers)
+k_centers = k_centers[valid]
+E_radial = E_radial[valid]
+
+# Spectral dissipation per shell (time-averaged spectrum)
+diss_radial = 2.0 * nu * (k_centers**2) * E_radial
+
+# find spectral-peak of dissipation
+if diss_radial.size > 0 and np.isfinite(diss_radial).any():
+    peak_idx = np.nanargmax(diss_radial)
+    k_peak = k_centers[peak_idx]
+    diss_peak = diss_radial[peak_idx]
+    print(f"Peak spectral dissipation at |k| = {k_peak:.6g}, ε_shell_peak = {diss_peak:.6g} (ν={nu})")
+else:
+    k_peak = None
+    diss_peak = None
+    print("No valid radial dissipation data found (empty or nan radial bins).")
+
+# ============================================================
+# 6. PARSEVAL CHECK (ENERGY CONSERVATION)
+# ============================================================
+E_spectral_mean = np.sum(E_mean)
+print(f"Parseval check -> Real-space mean: {E_real_mean:.6e}, Fourier-space mean: {E_spectral_mean:.6e}")
+ratio = E_spectral_mean / E_real_mean
+print(f"Energy ratio (should be ~1): {ratio:.6f}")
+
+# ============================================================
+# 7. SAVE DATA
+# ============================================================
+np.save("E_time_avg.npy", E_mean)
+np.save("amp_ts_kf.npy", amp_ts)
+np.save("phi_ts_kf.npy", phi_ts)
+np.save("Iu_ts_kf.npy", Iu_ts)
+np.save("Ekf_ts.npy", Ekf_ts)
+np.save("eps_ts.npy", eps_ts)
+np.save("k_centers.npy", k_centers)
+np.save("E_radial.npy", E_radial)
+np.save("diss_radial.npy", diss_radial)
+
+try:
+    np.savetxt("amp_ts_kf.csv", amp_ts, delimiter=',')
+    np.savetxt("phi_ts_kf.csv", phi_ts, delimiter=',')
+    np.savetxt("Iu_ts_kf.csv", Iu_ts, delimiter=',')
+    np.savetxt("Ekf_ts.csv", Ekf_ts, delimiter=',')
+    np.savetxt("eps_ts.csv", eps_ts, delimiter=',')
+    np.savez_compressed("time_series_bundle.npz", amp=amp_ts, phi=phi_ts, Iu=Iu_ts, Ekf=Ekf_ts, eps=eps_ts)
+    print("Also exported CSV files and time_series_bundle.npz for easier access.")
+except Exception as e:
+    print(f"Warning: failed to export CSV/NPZ: {e}")
+
+# ============================================================
+# 8. PLOTS (if available)
+# ============================================================
+if HAS_MATPLOTLIB and (not args.skip_plots):
+    # (A) Mean 2D energy spectrum (log10)
+    plt.figure(figsize=(6,5))
+    plt.title("Mean Energy Spectrum $E(k_x, k_y)$ (log10)")
+    plt.pcolormesh(KX_phys, KY_phys, np.log10(E_mean + 1e-20), shading="auto", cmap="viridis")
+    plt.colorbar(label="log10(Energy)")
+    plt.xlabel("$k_x$")
+    plt.ylabel("$k_y$")
+    plt.tight_layout()
+    plt.savefig("E_spectrum.png", dpi=300)
+    plt.show()
+
+    # (B) Radially averaged E(|k|) and spectral dissipation; mark spectral dissipation peak
+    fig, ax1 = plt.subplots(figsize=(8,6))
+    ax1.loglog(k_centers, E_radial, 'o-', color='purple', label=r"$E(|k|)$")
+    ax1.set_xlabel(r"$|k|$ (physical)")
+    ax1.set_ylabel(r"$E(|k|)$", color='purple')
+    ax1.tick_params(axis='y', labelcolor='purple')
+    ax1.set_ylim(bottom=1e-8)   # show down to 1e-8 as you requested
+
+    # k^-5/3 reference if possible
+    if len(k_centers) > 6:
+        ref = E_radial[5] * (k_centers / k_centers[5])**(-5/3)
+        ax1.loglog(k_centers, ref, 'k--', label=r"$k^{-5/3}$ slope")
+
+    ax2 = ax1.twinx()
+    ax2.loglog(k_centers, diss_radial, 's-', color='tab:green', label=r"$\epsilon(k)=2\nu k^2 E(k)$")
+    ax2.set_ylabel(r"Spectral dissipation $\epsilon(|k|)$", color='tab:green')
+    ax2.tick_params(axis='y', labelcolor='tab:green')
+
+    if k_peak is not None:
+        ax1.axvline(k_peak, color='red', linestyle='--', linewidth=1.2, label=f"|k|_peak = {k_peak:.3g}")
+        y_annot = max(1e-8, E_radial[peak_idx])
+        ax1.annotate(f"Peak dissipation\n|k|={k_peak:.3g}\n eps={diss_peak:.3g}",
+                     xy=(k_peak, y_annot),
+                     xytext=(k_peak*1.2, y_annot*10.0),
+                     arrowprops=dict(arrowstyle="->", color='red'),
+                     color='red')
+
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
+
+    plt.title("Radially Averaged Energy Spectrum and Spectral Dissipation")
+    plt.tight_layout()
+    plt.savefig("RadialSpectrum_with_dissipation.png", dpi=300)
+
+    # Also save a radial-only energy plot (with bottom 1e-8)
+    plt.figure(figsize=(7,5))
+    plt.loglog(k_centers, E_radial, 'o-', color='purple', label="E(|k|)")
+    if len(k_centers) > 6:
+        plt.loglog(k_centers, ref, 'k--', label=r"$k^{-5/3}$ slope")
+    plt.xlabel(r"$|k|$")
+    plt.ylabel(r"$E(|k|)$")
+    plt.ylim(bottom=1e-8)
+    plt.legend()
+    plt.title("Radially Averaged Energy Spectrum")
+    plt.tight_layout()
+    plt.savefig("RadialSpectrum.png")
+    plt.show()
+
+    # (C) Time evolution of forcing-mode diagnostics + instantaneous dissipation ε(t)
+    fig, axs = plt.subplots(4, 1, figsize=(12,9), sharex=True)
+    axs[0].plot(amp_ts, color='tab:blue')
+    axs[0].set_ylabel(r"$|a(k_f,t)|$")
+    axs[0].set_title("Amplitude of Forcing Mode (combined u + i v)")
+
+    axs[1].plot(np.unwrap(phi_ts), color='tab:orange')
+    axs[1].set_ylabel(r"$\phi(k_f,t)$")
+    axs[1].set_title("Phase of Forcing Mode (unwrapped)")
+
+    axs[2].plot(Iu_ts, color='tab:green')
+    axs[2].set_ylabel(r"$I(t) = -|a|\sin(\phi)$")
+    axs[2].set_title("Forcing-mode energy input diagnostic (textual proxy)")
+
+    axs[3].plot(eps_ts, color='tab:red')
+    axs[3].set_ylabel(r"$\epsilon(t)$")
+    axs[3].set_xlabel("Time frame")
+    axs[3].set_title("Instantaneous domain-averaged dissipation (spectral derivatives)")
+
+    # Optionally mark the time of max dissipation
+    t_peak = int(np.nanargmax(eps_ts))
+    axs[3].axvline(t_peak, color='k', linestyle='--', lw=0.8)
+    axs[3].annotate(f"max ε at t={t_peak}", xy=(t_peak, eps_ts[t_peak]),
+                    xytext=(t_peak*0.9, eps_ts.max()*0.6),
+                    arrowprops=dict(arrowstyle="->"))
+
+    plt.tight_layout()
+    plt.savefig("TimeEvolution_ForcingMode.png", dpi=300)
+    plt.show()
+
+    # (D) Parseval Energy Comparison
+    plt.figure(figsize=(6,4))
+    plt.bar(["Real space", "Fourier space"], [E_real_mean, E_spectral_mean], color=["steelblue","darkorange"])
+    plt.title("Parseval Energy Comparison")
+    plt.ylabel("Mean Kinetic Energy")
+    plt.tight_layout()
+    plt.savefig("EnergyComparison.png", dpi=300)
+    plt.show()
+
+    print("✅ Analysis complete. Results saved as:")
+    print("  - E_spectrum.png")
+    print("  - RadialSpectrum.png")
+    print("  - RadialSpectrum_with_dissipation.png")
+    print("  - TimeEvolution_ForcingMode.png")
+    print("  - EnergyComparison.png")
+    print("  - E_time_avg.npy, amp_ts_kf.npy, phi_ts_kf.npy, Iu_ts_kf.npy, Ekf_ts.npy, eps_ts.npy")
+else:
+    print("✅ Analysis complete. Numerical results saved as:")
+    print("  - E_time_avg.npy, amp_ts_kf.npy, phi_ts_kf.npy, Iu_ts_kf.npy, Ekf_ts.npy, eps_ts.npy")
+    print("  - amp_ts_kf.csv, phi_ts_kf.csv, Iu_ts_kf.csv, Ekf_ts.csv, eps_ts.csv")
+    print("  - time_series_bundle.npz")
+    if not HAS_MATPLOTLIB:
+        print("(Plots skipped — matplotlib not available)")
+    elif args.skip_plots:
+        print("(Plots skipped — --skip-plots was used)")
